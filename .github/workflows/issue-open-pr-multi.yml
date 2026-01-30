@@ -2,7 +2,7 @@ name: Issue → Open PRs (multiple branches)
 
 on:
   issues:
-    types: [opened, edited, labeled]
+    types: [labeled]
 
 permissions:
   contents: write
