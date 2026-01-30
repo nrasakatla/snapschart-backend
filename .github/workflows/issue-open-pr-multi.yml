@@ -165,4 +165,17 @@ jobs:
 
           gh issue comment "$issue" --body "$result"
 
+                  gh issue comment "$issue" --body "$result"
+
+      - name: Close issue after processing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          issue="${{ github.event.issue.number }}"
+
+          gh issue close "$issue" \
+            --comment "✅ Automation completed.
+
+
 
