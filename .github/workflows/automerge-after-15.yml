@@ -21,7 +21,7 @@ jobs:
           sudo apt-get install -y gh
 
       - name: Wait 15 minutes
-        run: sleep 900
+        run: sleep 60
 
       - name: Re-check PR and merge if green
         env:
