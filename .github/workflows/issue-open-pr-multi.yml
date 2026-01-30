@@ -48,6 +48,10 @@ jobs:
           echo "Auto-merge label not present. Exiting."
           exit 0
 
+      - name: Checkout repository
+        uses: actions/checkout@v4
+    
+
       - name: Install GitHub CLI
         run: |
           sudo apt-get update
