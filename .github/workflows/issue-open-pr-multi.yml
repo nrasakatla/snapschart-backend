@@ -2,7 +2,7 @@ name: Issue → Open PRs (multiple branches)
 
 on:
   issues:
-    types: [opened, labeled]
+    types: [opened, edited, labeled]
 
 permissions:
   contents: read
@@ -11,14 +11,41 @@ permissions:
 
 jobs:
   open_prs:
-    if: >
-      github.event.issue != null &&
-      contains(join(github.event.issue.labels.*.name, ','), 'auto-merge')
-
     runs-on: ubuntu-latest
 
     steps:
-      - name: Parse issue (branches + base)
+      - name: Debug event + labels
+        shell: bash
+        run: |
+          echo "event_name=${{ github.event_name }}"
+          echo "action=${{ github.event.action }}"
+          echo "issue_number=${{ github.event.issue.number }}"
+          echo "issue_title=${{ github.event.issue.title }}"
+          echo "label_names=${{ join(github.event.issue.labels.*.name, ',') }}"
+          echo "labels_json=${{ toJson(github.event.issue.labels) }}"
+
+      - name: Gate - require auto-merge label
+        id: gate
+        shell: bash
+        run: |
+          labels='${{ join(github.event.issue.labels.*.name, ",") }}'
+          echo "labels=$labels"
+          # accept either "auto-merge" or "automerge"
+          if [[ ",$labels," != *",auto-merge,"* && ",$labels," != *",automerge,"* ]]; then
+            echo "Auto-merge label not found. Exiting gracefully."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Install GitHub CLI
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gh
+
+      - name: Parse issue body (branches + base)
+        if: steps.gate.outputs.proceed == 'true'
         id: parse
         shell: bash
         run: |
@@ -29,42 +56,37 @@ jobs:
           body = event["issue"].get("body") or ""
 
           def grab(section):
-            m = re.search(rf"### {re.escape(section)}\n(.*?)(\n### |\Z)", body, re.S)
-            return (m.group(1).strip() if m else "")
+              m = re.search(rf"### {re.escape(section)}\n(.*?)(\n### |\Z)", body, re.S)
+              return (m.group(1).strip() if m else "")
 
-          base = grab("Target branch") or "main"
-          raw  = grab("Source branches (one per line)")
+          # The section names must match the Issue Template labels exactly
+          raw_branches = grab("Source branches (one per line)")
+          base = grab("Target branch") or "master"
 
-          # Split lines -> remove empty & bullet markers
           branches = []
-          for line in raw.splitlines():
-            line = line.strip()
-            line = re.sub(r"^[\-\*\u2022]\s*", "", line)  # remove bullets
-            if line:
-              branches.append(line)
+          for line in raw_branches.splitlines():
+              line = line.strip()
+              line = re.sub(r"^[\-\*\u2022]\s*", "", line)  # remove bullets
+              if line:
+                  branches.append(line)
 
-          # De-duplicate while preserving order
+          # De-dupe preserve order
           seen=set()
           uniq=[]
           for b in branches:
-            if b not in seen:
-              uniq.append(b)
-              seen.add(b)
+              if b not in seen:
+                  uniq.append(b)
+                  seen.add(b)
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-            f.write(f"base={base}\n")
-            # write branches as newline-separated blob
-            f.write("branches<<EOF\n")
-            f.write("\n".join(uniq) + "\n")
-            f.write("EOF\n")
+              f.write(f"base={base}\n")
+              f.write("branches<<EOF\n")
+              f.write("\n".join(uniq) + "\n")
+              f.write("EOF\n")
           PY
 
-      - name: Install GitHub CLI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gh
-
       - name: Create PRs for all branches
+        if: steps.gate.outputs.proceed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -74,46 +96,43 @@ jobs:
           branches="${{ steps.parse.outputs.branches }}"
 
           if [[ -z "$branches" ]]; then
-            gh issue comment "$issue" --body "❌ No source branches found in the issue."
+            gh issue comment "$issue" --body "❌ No branches found in issue body under: **Source branches (one per line)**"
             exit 1
           fi
 
-          result_md="### ✅ Auto PR results\nTarget branch: \`$base\`\n\n"
+          result="### ✅ Auto PR results\nTarget branch: \`$base\`\n\n"
+
+          # Validate base exists
+          if ! gh api "repos/${{ github.repository }}/branches/$base" >/dev/null 2>&1; then
+            gh issue comment "$issue" --body "❌ Target branch not found: \`$base\`"
+            exit 1
+          fi
 
           while IFS= read -r src; do
             [[ -z "$src" ]] && continue
 
-            # Guardrail: source != base
             if [[ "$src" == "$base" ]]; then
-              result_md+="- ⚠️ \`$src\`: skipped (source == target)\n"
+              result+="- ⚠️ \`$src\`: skipped (source == target)\n"
               continue
             fi
 
-            # Optional guardrail: allow only specific prefixes (uncomment if you want)
-            # if [[ ! "$src" =~ ^(feature/|bugfix/|hotfix/).+ ]]; then
-            #   result_md+="- ❌ \`$src\`: blocked (branch name not allowed)\n"
-            #   continue
-            # fi
-
-            # Branch existence check
+            # Branch existence
             if ! gh api "repos/${{ github.repository }}/branches/$src" >/dev/null 2>&1; then
-              result_md+="- ❌ \`$src\`: branch not found\n"
+              result+="- ❌ \`$src\`: branch not found\n"
               continue
             fi
 
-            # If an open PR already exists for head->base, reuse it
+            # Reuse existing open PR if present
             existing_url=$(gh pr list --head "$src" --base "$base" --state open --json url -q '.[0].url' 2>/dev/null || true)
             if [[ -n "$existing_url" ]]; then
-              # ensure labels exist (idempotent)
               gh pr edit "$existing_url" --add-label "automerge" --add-label "auto-merge" >/dev/null 2>&1 || true
-              result_md+="- 🔁 \`$src\`: PR already exists → $existing_url\n"
+              result+="- 🔁 \`$src\`: PR already exists → $existing_url\n"
               continue
             fi
 
-            # Create PR
             pr_url=$(gh pr create \
               --title "Auto PR: $src → $base (issue #$issue)" \
-              --body "Opened automatically from issue #$issue.\n\n⏳ Auto-merge will be attempted in 15 minutes if checks pass." \
+              --body "Opened automatically from issue #$issue.\n\n⏳ Auto-merge will be attempted after the delay if checks pass." \
               --base "$base" \
               --head "$src" \
               --label "automerge" \
@@ -121,10 +140,14 @@ jobs:
               --json url -q .url 2>/dev/null || true)
 
             if [[ -n "$pr_url" ]]; then
-              result_md+="- ✅ \`$src\`: PR created → $pr_url\n"
+              result+="- ✅ \`$src\`: PR created → $pr_url\n"
             else
-              result_md+="- ❌ \`$src\`: failed to create PR (check workflow logs)\n"
+              result+="- ❌ \`$src\`: failed to create PR (check Actions logs)\n"
             fi
+
+          done <<< "$branches"
+
+          gh issue comment "$issue" --body "$result"
 
           done <<< "$branches"
 
