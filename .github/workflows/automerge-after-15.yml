@@ -1,0 +1,46 @@
+name: Auto-merge after 15 minutes
+
+on:
+  pull_request:
+    types: [opened, labeled, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+jobs:
+  merge:
+    if: contains(github.event.pull_request.labels.*.name, 'automerge')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Wait 15 minutes
+        run: sleep 60
+
+      - name: Validate checks and merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pr="${{ github.event.pull_request.number }}"
+
+          state=$(gh pr view "$pr" --json state -q '.state')
+          mergeable=$(gh pr view "$pr" --json mergeable -q '.mergeable')
+
+          if [[ "$state" != "OPEN" ]]; then
+            echo "PR is not open: $state" && exit 0
+          fi
+
+          if [[ "$mergeable" != "MERGEABLE" ]]; then
+            echo "PR not mergeable: $mergeable" && exit 1
+          fi
+
+          failed=$(gh pr view "$pr" --json statusCheckRollup -q '
+            [.statusCheckRollup[] | select(.conclusion != "SUCCESS" and .conclusion != null)] | length
+          ')
+
+          if [[ "$failed" != "0" ]]; then
+            echo "Checks not green. Not merging." && exit 1
+          fi
+
+          gh pr merge "$pr" --merge --delete-branch
