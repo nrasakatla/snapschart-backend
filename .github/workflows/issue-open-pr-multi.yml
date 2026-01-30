@@ -14,52 +14,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Debug event + labels
-        shell: bash
+      - name: Gate – run only for auto-merge label
+        if: github.event.label.name != 'auto-merge'
         run: |
-          echo "event_name=${{ github.event_name }}"
-          echo "action=${{ github.event.action }}"
-          echo "issue_number=${{ github.event.issue.number }}"
-          echo "issue_title=${{ github.event.issue.title }}"
-          echo "labels_json=${{ toJson(github.event.issue.labels) }}"
-
-      - name: Gate - require auto-merge label
-        id: gate
-        shell: bash
-        env:
-          LABELS_JSON: ${{ toJson(github.event.issue.labels.*.name) }}
-        run: |
-          python3 - <<'PY'
-          import json, os
-          labels = []
-          try:
-            labels = json.loads(os.environ.get("LABELS_JSON","[]"))
-          except Exception:
-            pass
-          ok = ("auto-merge" in labels) or ("automerge" in labels)
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-            f.write("proceed=" + ("true" if ok else "false") + "\n")
-          print("proceed=" + ("true" if ok else "false"))
-          PY
-
-      - name: Stop if label missing
-        if: steps.gate.outputs.proceed != 'true'
-        shell: bash
-        run: |
-          echo "Auto-merge label not present. Exiting."
+          echo "Not auto-merge label. Exiting."
           exit 0
 
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Debug token permissions
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          gh --version || true
-          gh auth status || true
-          gh api repos/${{ github.repository }} --jq '{default_branch: .default_branch, private: .private, permissions: .permissions}' || true
 
       - name: Parse issue body (branches + base)
         id: parse
@@ -67,6 +29,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import json, re, os
+
           event = json.load(open(os.environ["GITHUB_EVENT_PATH"]))
           body = event["issue"].get("body") or ""
 
@@ -79,17 +42,14 @@ jobs:
 
           branches = []
           for line in raw_branches.splitlines():
-              line = line.strip()
-              line = re.sub(r"^[\-\*\u2022]\s*", "", line)
+              line = line.strip().lstrip("-* ")
               if line:
                   branches.append(line)
 
-          seen=set()
-          uniq=[]
+          uniq = []
           for b in branches:
-              if b not in seen:
+              if b not in uniq:
                   uniq.append(b)
-                  seen.add(b)
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"base={base}\n")
@@ -109,73 +69,44 @@ jobs:
           base="${{ steps.parse.outputs.base }}"
           branches="${{ steps.parse.outputs.branches }}"
 
-          if [[ -z "$branches" ]]; then
-            gh issue comment "$issue" --body "❌ No branches found in issue under **Source branches (one per line)**."
-            exit 1
-          fi
-
           result="### ✅ Auto PR results\nTarget branch: \`$base\`\n\n"
-
-          if ! gh api "repos/${{ github.repository }}/branches/$base" >/dev/null 2>&1; then
-            gh issue comment "$issue" --body "❌ Target branch not found: \`$base\`"
-            exit 1
-          fi
 
           while IFS= read -r src; do
             [[ -z "$src" ]] && continue
 
-            if [[ "$src" == "$base" ]]; then
-              result+="- ⚠️ \`$src\`: skipped (source == target)\n"
-              continue
-            fi
-
-            if ! gh api "repos/${{ github.repository }}/branches/$src" >/dev/null 2>&1; then
-              result+="- ❌ \`$src\`: branch not found\n"
-              continue
-            fi
-
-            existing_url=$(gh pr list --head "$src" --base "$base" --state open --json url -q '.[0].url' 2>/dev/null || true)
-            if [[ -n "$existing_url" ]]; then
-              gh pr edit "$existing_url" --add-label "automerge" --add-label "auto-merge" >/dev/null 2>&1 || true
-              result+="- 🔁 \`$src\`: PR already exists → $existing_url\n"
+            existing=$(gh pr list --head "$src" --base "$base" --state open | awk '{print $1}' | head -n 1 || true)
+            if [[ -n "$existing" ]]; then
+              gh pr edit "$existing" --add-label "automerge" >/dev/null 2>&1 || true
+              result+="- 🔁 \`$src\`: PR already exists → $existing\n"
               continue
             fi
 
             set +e
             out=$(gh pr create \
               --title "Auto PR: $src → $base (issue #$issue)" \
-              --body "Opened automatically from issue #$issue.\n\n⏳ Auto-merge will be attempted after the delay if checks pass." \
+              --body "Opened automatically from issue #$issue." \
               --base "$base" \
               --head "$src" \
-              --label "automerge" \
-              --label "auto-merge" 2>&1)
+              --label "automerge" 2>&1)
             code=$?
             set -e
 
             if [[ $code -eq 0 ]]; then
-              # gh pr create prints the PR URL on success (newer gh); if not, show raw output
               url=$(echo "$out" | tail -n 1)
               result+="- ✅ \`$src\`: PR created → $url\n"
             else
-              short=$(echo "$out" | tr '\n' ' ' | cut -c1-300)
-              result+="- ❌ \`$src\`: PR create failed → \`$short\`\n"
+              result+="- ❌ \`$src\`: $out\n"
             fi
-
           done <<< "$branches"
 
           gh issue comment "$issue" --body "$result"
 
-                  gh issue comment "$issue" --body "$result"
-
       - name: Close issue after processing
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
         run: |
-          issue="${{ github.event.issue.number }}"
-
-          gh issue close "$issue" \
-            --comment "✅ Automation completed.
+          gh issue close "${{ github.event.issue.number }}" \
+            --comment "✅ Automation completed. Closing issue."
 
 
 
