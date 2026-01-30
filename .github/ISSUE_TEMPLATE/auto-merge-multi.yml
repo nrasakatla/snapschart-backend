@@ -23,7 +23,7 @@ body:
     id: base_branch
     attributes:
       label: Target branch
-      value: "main"
+      value: "master"
     validations:
       required: true
 
