@@ -1,152 +1,59 @@
-name: Issue → Open PRs (multiple branches)
+name: Auto-merge PR after 15 minutes (no branch delete)
 
 on:
-  issues:
-    types: [opened, edited, labeled]
+  pull_request:
+    types: [labeled]
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
-  issues: write
 
 jobs:
-  open_prs:
+  automerge:
+    # Run only when label "automerge" is added to the PR
+    if: github.event.label.name == 'automerge'
     runs-on: ubuntu-latest
 
     steps:
-      - name: Debug event + labels
-        shell: bash
-        run: |
-          echo "event_name=${{ github.event_name }}"
-          echo "action=${{ github.event.action }}"
-          echo "issue_number=${{ github.event.issue.number }}"
-          echo "issue_title=${{ github.event.issue.title }}"
-          echo "label_names=${{ join(github.event.issue.labels.*.name, ',') }}"
-          echo "labels_json=${{ toJson(github.event.issue.labels) }}"
+      - name: Wait 15 minutes
+        run: sleep 900
 
-      - name: Gate - require auto-merge label
-        id: gate
-        shell: bash
-        run: |
-          labels='${{ join(github.event.issue.labels.*.name, ",") }}'
-          echo "labels=$labels"
-          # accept either "auto-merge" or "automerge"
-          if [[ ",$labels," != *",auto-merge,"* && ",$labels," != *",automerge,"* ]]; then
-            echo "Auto-merge label not found. Exiting gracefully."
-            echo "proceed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "proceed=true" >> "$GITHUB_OUTPUT"
-
-      - name: Install GitHub CLI
-        if: steps.gate.outputs.proceed == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gh
-
-      - name: Parse issue body (branches + base)
-        if: steps.gate.outputs.proceed == 'true'
-        id: parse
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import json, re, os
-
-          event = json.load(open(os.environ["GITHUB_EVENT_PATH"]))
-          body = event["issue"].get("body") or ""
-
-          def grab(section):
-              m = re.search(rf"### {re.escape(section)}\n(.*?)(\n### |\Z)", body, re.S)
-              return (m.group(1).strip() if m else "")
-
-          # The section names must match the Issue Template labels exactly
-          raw_branches = grab("Source branches (one per line)")
-          base = grab("Target branch") or "master"
-
-          branches = []
-          for line in raw_branches.splitlines():
-              line = line.strip()
-              line = re.sub(r"^[\-\*\u2022]\s*", "", line)  # remove bullets
-              if line:
-                  branches.append(line)
-
-          # De-dupe preserve order
-          seen=set()
-          uniq=[]
-          for b in branches:
-              if b not in seen:
-                  uniq.append(b)
-                  seen.add(b)
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"base={base}\n")
-              f.write("branches<<EOF\n")
-              f.write("\n".join(uniq) + "\n")
-              f.write("EOF\n")
-          PY
-
-      - name: Create PRs for all branches
-        if: steps.gate.outputs.proceed == 'true'
+      - name: Merge PR if still mergeable (keep branch)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          issue="${{ github.event.issue.number }}"
-          base="${{ steps.parse.outputs.base }}"
-          branches="${{ steps.parse.outputs.branches }}"
+          set -e
+          pr="${{ github.event.pull_request.number }}"
+          repo="${{ github.repository }}"
 
-          if [[ -z "$branches" ]]; then
-            gh issue comment "$issue" --body "❌ No branches found in issue body under: **Source branches (one per line)**"
-            exit 1
+          # Ensure PR is still open
+          state=$(gh api "repos/$repo/pulls/$pr" --jq '.state')
+          echo "PR state=$state"
+          if [[ "$state" != "open" ]]; then
+            echo "PR is not open anymore. Exiting."
+            exit 0
           fi
 
-          result="### ✅ Auto PR results\nTarget branch: \`$base\`\n\n"
-
-          # Validate base exists
-          if ! gh api "repos/${{ github.repository }}/branches/$base" >/dev/null 2>&1; then
-            gh issue comment "$issue" --body "❌ Target branch not found: \`$base\`"
-            exit 1
+          # mergeable can be null while GitHub is computing it
+          mergeable=$(gh api "repos/$repo/pulls/$pr" --jq '.mergeable')
+          echo "mergeable=$mergeable"
+          if [[ "$mergeable" == "null" ]]; then
+            echo "Mergeability not ready yet. Re-checking..."
+            for i in 1 2 3 4 5; do
+              sleep 10
+              mergeable=$(gh api "repos/$repo/pulls/$pr" --jq '.mergeable')
+              echo "mergeable=$mergeable"
+              [[ "$mergeable" != "null" ]] && break
+            done
           fi
 
-          while IFS= read -r src; do
-            [[ -z "$src" ]] && continue
+          if [[ "$mergeable" != "true" ]]; then
+            echo "PR is not mergeable (blocked/conflicts). Exiting."
+            exit 0
+          fi
 
-            if [[ "$src" == "$base" ]]; then
-              result+="- ⚠️ \`$src\`: skipped (source == target)\n"
-              continue
-            fi
-
-            # Branch existence
-            if ! gh api "repos/${{ github.repository }}/branches/$src" >/dev/null 2>&1; then
-              result+="- ❌ \`$src\`: branch not found\n"
-              continue
-            fi
-
-            # Reuse existing open PR if present
-            existing_url=$(gh pr list --head "$src" --base "$base" --state open --json url -q '.[0].url' 2>/dev/null || true)
-            if [[ -n "$existing_url" ]]; then
-              gh pr edit "$existing_url" --add-label "automerge" --add-label "auto-merge" >/dev/null 2>&1 || true
-              result+="- 🔁 \`$src\`: PR already exists → $existing_url\n"
-              continue
-            fi
-
-            pr_url=$(gh pr create \
-              --title "Auto PR: $src → $base (issue #$issue)" \
-              --body "Opened automatically from issue #$issue.\n\n⏳ Auto-merge will be attempted after the delay if checks pass." \
-              --base "$base" \
-              --head "$src" \
-              --label "automerge" \
-              --label "auto-merge" \
-              --json url -q .url 2>/dev/null || true)
-
-            if [[ -n "$pr_url" ]]; then
-              result+="- ✅ \`$src\`: PR created → $pr_url\n"
-            else
-              result+="- ❌ \`$src\`: failed to create PR (check Actions logs)\n"
-            fi
-
-          done <<< "$branches"
-
-          gh issue comment "$issue" --body "$result"
-
+          # Merge without deleting the source branch
+          # Options: --squash (recommended), --merge, --rebase
+          gh pr merge "$pr" --squash
 
