@@ -1,1 +1,29 @@
-test
+name: "Automation: PR + Merge from branch"
+description: "Open PR from an existing branch and auto-merge after 15 minutes"
+title: "[auto-merge] "
+labels: ["auto-merge"]
+body:
+  - type: input
+    id: source_branch
+    attributes:
+      label: Source branch (must already exist)
+      placeholder: "feature/my-change"
+    validations:
+      required: true
+
+  - type: input
+    id: base_branch
+    attributes:
+      label: Target branch
+      placeholder: "main"
+      value: "main"
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes (optional)
+      placeholder: "What is this merge for?"
+    validations:
+      required: false
