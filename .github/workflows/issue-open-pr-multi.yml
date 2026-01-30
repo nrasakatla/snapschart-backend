@@ -12,8 +12,9 @@ permissions:
 jobs:
   open_prs:
     if: >
-      contains(github.event.issue.labels.*.name, 'auto-merge') &&
-      startsWith(github.event.issue.title, '[auto-merge]')
+      github.event.issue != null &&
+      contains(join(github.event.issue.labels.*.name, ','), 'auto-merge')
+
     runs-on: ubuntu-latest
 
     steps:
