@@ -1,0 +1,36 @@
+name: "Automation: PR + Merge (multiple branches)"
+description: "Provide one or more source branches. Bot will open PRs and auto-merge after 15 mins."
+title: "[auto-merge] "
+labels: ["auto-merge"]
+body:
+  - type: textarea
+    id: source_branches
+    attributes:
+      label: Source branches (one per line)
+      description: |
+        Branches must already exist in this repo.
+        Example:
+          feature/a
+          bugfix/b
+          hotfix/c
+      placeholder: |
+        feature/my-branch-1
+        feature/my-branch-2
+    validations:
+      required: true
+
+  - type: input
+    id: base_branch
+    attributes:
+      label: Target branch
+      value: "main"
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes (optional)
+      placeholder: "Any context for these merges"
+    validations:
+      required: false
