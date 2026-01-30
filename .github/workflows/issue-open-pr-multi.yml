@@ -5,7 +5,7 @@ on:
     types: [opened, edited, labeled]
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
   issues: write
 
@@ -29,19 +29,16 @@ jobs:
         env:
           LABELS_JSON: ${{ toJson(github.event.issue.labels.*.name) }}
         run: |
-          echo "LABELS_JSON=$LABELS_JSON"
-
           python3 - <<'PY'
           import json, os
-          labels_json = os.environ.get("LABELS_JSON", "[]")
+          labels = []
           try:
-              labels = json.loads(labels_json) if labels_json else []
+            labels = json.loads(os.environ.get("LABELS_JSON","[]"))
           except Exception:
-              labels = []
+            pass
           ok = ("auto-merge" in labels) or ("automerge" in labels)
-          out_path = os.environ["GITHUB_OUTPUT"]
-          with open(out_path, "a") as f:
-              f.write("proceed=" + ("true" if ok else "false") + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+            f.write("proceed=" + ("true" if ok else "false") + "\n")
           print("proceed=" + ("true" if ok else "false"))
           PY
 
@@ -55,16 +52,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install GitHub CLI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gh
-
       - name: Debug token permissions
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
+          gh --version || true
           gh auth status || true
           gh api repos/${{ github.repository }} --jq '{default_branch: .default_branch, private: .private, permissions: .permissions}' || true
 
@@ -74,7 +67,6 @@ jobs:
         run: |
           python3 - <<'PY'
           import json, re, os
-
           event = json.load(open(os.environ["GITHUB_EVENT_PATH"]))
           body = event["issue"].get("body") or ""
 
@@ -92,7 +84,6 @@ jobs:
               if line:
                   branches.append(line)
 
-          # De-duplicate preserving order
           seen=set()
           uniq=[]
           for b in branches:
@@ -125,7 +116,6 @@ jobs:
 
           result="### ✅ Auto PR results\nTarget branch: \`$base\`\n\n"
 
-          # Ensure base exists
           if ! gh api "repos/${{ github.repository }}/branches/$base" >/dev/null 2>&1; then
             gh issue comment "$issue" --body "❌ Target branch not found: \`$base\`"
             exit 1
@@ -139,13 +129,11 @@ jobs:
               continue
             fi
 
-            # Ensure source exists
             if ! gh api "repos/${{ github.repository }}/branches/$src" >/dev/null 2>&1; then
               result+="- ❌ \`$src\`: branch not found\n"
               continue
             fi
 
-            # If open PR already exists, reuse it
             existing_url=$(gh pr list --head "$src" --base "$base" --state open --json url -q '.[0].url' 2>/dev/null || true)
             if [[ -n "$existing_url" ]]; then
               gh pr edit "$existing_url" --add-label "automerge" --add-label "auto-merge" >/dev/null 2>&1 || true
@@ -153,7 +141,6 @@ jobs:
               continue
             fi
 
-            # Create PR and capture errors
             set +e
             out=$(gh pr create \
               --title "Auto PR: $src → $base (issue #$issue)" \
@@ -161,14 +148,14 @@ jobs:
               --base "$base" \
               --head "$src" \
               --label "automerge" \
-              --label "auto-merge" \
-              --json url -q .url 2>&1)
+              --label "auto-merge" 2>&1)
             code=$?
             set -e
 
-            if [[ $code -eq 0 && -n "$out" ]]; then
-              pr_url="$out"
-              result+="- ✅ \`$src\`: PR created → $pr_url\n"
+            if [[ $code -eq 0 ]]; then
+              # gh pr create prints the PR URL on success (newer gh); if not, show raw output
+              url=$(echo "$out" | tail -n 1)
+              result+="- ✅ \`$src\`: PR created → $url\n"
             else
               short=$(echo "$out" | tr '\n' ' ' | cut -c1-300)
               result+="- ❌ \`$src\`: PR create failed → \`$short\`\n"
@@ -177,4 +164,5 @@ jobs:
           done <<< "$branches"
 
           gh issue comment "$issue" --body "$result"
+
 
