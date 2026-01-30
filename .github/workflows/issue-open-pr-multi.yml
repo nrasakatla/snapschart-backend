@@ -26,20 +26,24 @@ jobs:
       - name: Gate - require auto-merge label
         id: gate
         shell: bash
-        run: |
-          # Avoid join() quoting issues; use JSON string and contains()
-          labels_json='${{ toJson(github.event.issue.labels.*.name) }}'
-          echo "labels_json=$labels_json"
-
-          python3 - <<'PY'
-          import json, os, sys
-          labels_json = os.environ.get("LABELS_JSON", "[]")
-          labels = json.loads(labels_json) if labels_json else []
-          ok = ("auto-merge" in labels) or ("automerge" in labels)
-          print("proceed=" + ("true" if ok else "false"))
-          PY
         env:
           LABELS_JSON: ${{ toJson(github.event.issue.labels.*.name) }}
+        run: |
+          echo "LABELS_JSON=$LABELS_JSON"
+
+          python3 - <<'PY'
+          import json, os
+          labels_json = os.environ.get("LABELS_JSON", "[]")
+          try:
+              labels = json.loads(labels_json) if labels_json else []
+          except Exception:
+              labels = []
+          ok = ("auto-merge" in labels) or ("automerge" in labels)
+          out_path = os.environ["GITHUB_OUTPUT"]
+          with open(out_path, "a") as f:
+              f.write("proceed=" + ("true" if ok else "false") + "\n")
+          print("proceed=" + ("true" if ok else "false"))
+          PY
 
       - name: Stop if label missing
         if: steps.gate.outputs.proceed != 'true'
@@ -50,12 +54,19 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v4
-    
 
       - name: Install GitHub CLI
         run: |
           sudo apt-get update
           sudo apt-get install -y gh
+
+      - name: Debug token permissions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh auth status || true
+          gh api repos/${{ github.repository }} --jq '{default_branch: .default_branch, private: .private, permissions: .permissions}' || true
 
       - name: Parse issue body (branches + base)
         id: parse
@@ -81,6 +92,7 @@ jobs:
               if line:
                   branches.append(line)
 
+          # De-duplicate preserving order
           seen=set()
           uniq=[]
           for b in branches:
@@ -100,6 +112,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
+          set -e
+
           issue="${{ github.event.issue.number }}"
           base="${{ steps.parse.outputs.base }}"
           branches="${{ steps.parse.outputs.branches }}"
@@ -125,11 +139,13 @@ jobs:
               continue
             fi
 
+            # Ensure source exists
             if ! gh api "repos/${{ github.repository }}/branches/$src" >/dev/null 2>&1; then
               result+="- ❌ \`$src\`: branch not found\n"
               continue
             fi
 
+            # If open PR already exists, reuse it
             existing_url=$(gh pr list --head "$src" --base "$base" --state open --json url -q '.[0].url' 2>/dev/null || true)
             if [[ -n "$existing_url" ]]; then
               gh pr edit "$existing_url" --add-label "automerge" --add-label "auto-merge" >/dev/null 2>&1 || true
@@ -137,20 +153,28 @@ jobs:
               continue
             fi
 
-            pr_url=$(gh pr create \
+            # Create PR and capture errors
+            set +e
+            out=$(gh pr create \
               --title "Auto PR: $src → $base (issue #$issue)" \
               --body "Opened automatically from issue #$issue.\n\n⏳ Auto-merge will be attempted after the delay if checks pass." \
               --base "$base" \
               --head "$src" \
               --label "automerge" \
               --label "auto-merge" \
-              --json url -q .url 2>/dev/null || true)
+              --json url -q .url 2>&1)
+            code=$?
+            set -e
 
-            if [[ -n "$pr_url" ]]; then
+            if [[ $code -eq 0 && -n "$out" ]]; then
+              pr_url="$out"
               result+="- ✅ \`$src\`: PR created → $pr_url\n"
             else
-              result+="- ❌ \`$src\`: failed to create PR (see Actions logs)\n"
+              short=$(echo "$out" | tr '\n' ' ' | cut -c1-300)
+              result+="- ❌ \`$src\`: PR create failed → \`$short\`\n"
             fi
+
           done <<< "$branches"
 
           gh issue comment "$issue" --body "$result"
+
