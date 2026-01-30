@@ -15,32 +15,45 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Wait 15 minutes
-        run: sleep 60
+      - name: Install GitHub CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gh
 
-      - name: Validate checks and merge
+      - name: Wait 15 minutes
+        run: sleep 900
+
+      - name: Re-check PR and merge if green
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
           pr="${{ github.event.pull_request.number }}"
 
+          # PR must still be open
           state=$(gh pr view "$pr" --json state -q '.state')
-          mergeable=$(gh pr view "$pr" --json mergeable -q '.mergeable')
-
           if [[ "$state" != "OPEN" ]]; then
-            echo "PR is not open: $state" && exit 0
+            echo "PR not open anymore: $state"
+            exit 0
           fi
 
+          # Must be mergeable (no conflicts)
+          mergeable=$(gh pr view "$pr" --json mergeable -q '.mergeable')
           if [[ "$mergeable" != "MERGEABLE" ]]; then
-            echo "PR not mergeable: $mergeable" && exit 1
+            echo "PR not mergeable: $mergeable"
+            exit 1
           fi
 
+          # All checks must be SUCCESS (if there are checks)
           failed=$(gh pr view "$pr" --json statusCheckRollup -q '
-            [.statusCheckRollup[] | select(.conclusion != "SUCCESS" and .conclusion != null)] | length
+            ([.statusCheckRollup[] | select(.conclusion != "SUCCESS" and .conclusion != null)] | length)
           ')
 
           if [[ "$failed" != "0" ]]; then
-            echo "Checks not green. Not merging." && exit 1
+            echo "Checks not green. Not merging."
+            exit 1
           fi
 
+          # Merge
           gh pr merge "$pr" --merge --delete-branch
+
